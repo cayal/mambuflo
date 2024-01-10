@@ -16,22 +16,22 @@ enum MamBufLoError: Error {
          internalError
 }
 
-public struct HypotheticalBuf {
+struct HypotheticalBuf {
     var metadata: InputMetadata
     var pathOnDisk: String
     var byteCount: Int
 }
 
 public struct LoadedBuf {
-    var data: MTLBuffer
-    var meta: InputMetadata
+    public var data: MTLBuffer
+    public var meta: InputMetadata
 }
 
 public struct MamBufLoSoldier {
-    var heartOf: MTLHeap
-    var hParams: MambaHParams
-    var base: [String:LoadedBuf]
-    var layers: [[String:LoadedBuf]]
+    public var heartOf: MTLHeap
+    public var hParams: MambaHParams
+    public var base: [String:LoadedBuf]
+    public var layers: [[String:LoadedBuf]]
 }
 
 public class MamBufLoBuilder {
@@ -180,7 +180,7 @@ public class MamBufLoBuilder {
         }
     }
     
-    public func matchToPlanElement(_ plan: Dictionary<String, [Int]>, _ metadata: InputMetadata) throws -> Dictionary<String, [Int]>.Element {
+    func matchToPlanElement(_ plan: Dictionary<String, [Int]>, _ metadata: InputMetadata) throws -> Dictionary<String, [Int]>.Element {
         guard let planElement = plan.first(where: {k, v in metadata.key.contains(k)}) else {
             throw MamBufLoError.invalidParameter("\(metadata.key) has no parts matching: \(plan.keys.debugDescription)")
         }
@@ -190,14 +190,14 @@ public class MamBufLoBuilder {
         return planElement
     }
     
-    public func includeOuterState(_ metadata: InputMetadata, pathOnDisk: String) throws {
+    func includeOuterState(_ metadata: InputMetadata, pathOnDisk: String) throws {
         let planElement = try matchToPlanElement(buildingSpec.stateShapes, metadata)
         baseStates[planElement.key] = HypotheticalBuf(metadata:metadata,
                                                       pathOnDisk: pathOnDisk,
                                                       byteCount: metadata.shape.reduce(1, *) * MemoryLayout<Float16>.stride)
     }
     
-    public func includeLayerState(_ layerNumber: Int, _ metadata: InputMetadata, pathOnDisk: String) throws {
+    func includeLayerState(_ layerNumber: Int, _ metadata: InputMetadata, pathOnDisk: String) throws {
         guard layerStates[layerNumber] != nil else { throw MamBufLoError.unknownLayer(String(layerNumber)) }
         let planElement = try matchToPlanElement(buildingSpec.perLayerStateShapes, metadata)
         layerStates[layerNumber]![planElement.key] = HypotheticalBuf(metadata: metadata,
