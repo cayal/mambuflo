@@ -3,8 +3,8 @@ import Foundation
 public struct InputMetadata: Decodable
 {
     var key: String
-    var shape: [Int]
-    var stride: [Int]
+    var shape: [UInt32]
+    var stride: [UInt32]
     
     enum CodingKeys : String, CodingKey {
         case key
@@ -15,42 +15,16 @@ public struct InputMetadata: Decodable
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         key        = try values.decode(String.self, forKey: .key)
-        shape      = try values.decode(Array<Int>.self, forKey: .shape)
-        stride     = try values.decode(Array<Int>.self, forKey: .stride)
+        shape      = try values.decode(Array<UInt32>.self, forKey: .shape)
+        stride     = try values.decode(Array<UInt32>.self, forKey: .stride)
     }
 }
 
-public protocol ModelStateSpec {
-    associatedtype T: MambaHParams
+public protocol ModelStateSpec<T> {
+    associatedtype T
     var name: String { get }
-    var nLayers: Int { get }
     var hp: T { get }
-    var stateShapes:      [String:[Int]] { get }
-    var perLayerStateShapes: [String:[Int]] { get }
+    var stateShapes:      [String:[UInt32]] { get }
+    var perLayerStateShapes: [String:[UInt32]] { get }
 }
 
-public protocol MambaHParams
-{
-    // SSM state expansion factor
-    var dState: Int { get }
-    
-    // Vocab size
-    var nVocab: Int { get }
-    
-    // Model dimensions
-    var dModel: Int { get }
-    
-    // Block expansion factor
-    var expand: Int { get }
-    
-    // Local convolution width
-    var dConv: Int { get }
-    
-    // Rank of ∆
-    var dtRank: Int { get }
-    
-    // Hidden state dimension
-    var dInner: Int { get }
-    
-    init()
-}

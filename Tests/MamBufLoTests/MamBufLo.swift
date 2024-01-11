@@ -6,7 +6,7 @@ final class BufLoaderTests: XCTestCase {
     var q: MTLCommandQueue!
     var cmdBuf: MTLCommandBuffer!
     var path: String!
-    var stateSpec: (any ModelStateSpec)!
+    var stateSpec: (any ModelStateSpec<OGHParams>)!
     
     override func setUp() {
         super.setUp()
@@ -31,8 +31,8 @@ final class BufLoaderTests: XCTestCase {
     }
     
     func testInitialization() throws {
-        let MBL = try MamBufLoBuilder(self.stateSpec)
-        XCTAssert(MBL.layerStates.count == self.stateSpec.nLayers)
+        let MBL = try MamBufLoBuilder<OGHParams>(self.stateSpec, nLayers: self.stateSpec.hp.nLayers)
+        XCTAssert(MBL.layerStates.count == self.stateSpec.hp.nLayers)
         XCTAssert(MBL.baseStates.count == self.stateSpec.stateShapes.count)
         XCTAssert(MBL.layerStates[0]?.count == self.stateSpec.perLayerStateShapes.count)
     }
@@ -43,7 +43,7 @@ final class BufLoaderTests: XCTestCase {
         XCTAssert(contents.count > 0)
         
         var expectedSize = 0
-        let MBL = try MamBufLoBuilder(self.stateSpec)
+        let MBL = try MamBufLoBuilder(self.stateSpec, nLayers: self.stateSpec.hp.nLayers)
         for cont in contents {
             let metadataPath = self.path + "/" + cont + "/metadata.json"
             let metadataJson = try String(contentsOfFile: metadataPath)
@@ -60,37 +60,34 @@ final class BufLoaderTests: XCTestCase {
             try MBL.include(metadata, pathOnDisk: binDataPath)
         }
         var state = try MBL.complete(device: device, cmdQ: q)
-        XCTAssertEqual(state.layers.count, self.stateSpec.nLayers)
+        XCTAssertEqual(UInt32(state.layers.count), self.stateSpec.hp.nLayers)
         XCTAssertEqual(state.base.count, self.stateSpec.stateShapes.count)
         XCTAssertEqual(state.layers[0].count, self.stateSpec.perLayerStateShapes.count)
         XCTAssertEqual(state.heartOf.size, state.heartOf.currentAllocatedSize)
         XCTAssertGreaterThanOrEqual(state.heartOf.currentAllocatedSize, expectedSize)
     }
 }
-struct OG130HParams: MambaHParams
-{
-    let dState = 16
-    let nVocab = 50280
-    let dModel = 768
-    let expand = 2
-    let dConv = 4
-    var dtRank: Int { dModel / 16 }
-    var dInner: Int { dModel * expand }
-}
 
 struct OG130: ModelStateSpec
 {
     let name = "mamba-130m"
-    let nLayers = 24
-    let hp = OG130HParams()
-    var stateShapes: [String : [Int]]
+    let hp = OGHParams(nLayers: 24,
+                       dState: 16,
+                       nVocab: 50280,
+                       dModel: 768,
+                       expand: 2,
+                       dConv: 4,
+                       dtRank: 768 / 16,
+                       dInner: 768 * 2
+    )
+    var stateShapes: [String : [UInt32]]
     {[
         "embedding.weight":     [hp.nVocab, hp.dModel],
         "lm_head.weight":       [hp.nVocab, hp.dModel],
         "norm_f.weight":        [hp.dModel],
     ]}
     
-    var perLayerStateShapes: [String : [Int]] 
+    var perLayerStateShapes: [String : [UInt32]]
     {[
         "norm.weight":          [hp.dModel],
         "mixer.A_log":          [hp.dInner, hp.dState],

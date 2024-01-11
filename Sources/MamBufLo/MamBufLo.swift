@@ -5,8 +5,8 @@ enum MamBufLoError: Error {
          invalidParameter(String),
          invalidParameterShape(String),
          missingBase(String),
-         extraneousLayer(Int),
-         missingLayer(Int),
+         extraneousLayer(UInt32),
+         missingLayer(UInt32),
          incompleteLayer(String),
          unknownLayer(String),
          failedToMakeCommandBuffer,
@@ -19,33 +19,37 @@ enum MamBufLoError: Error {
 struct HypotheticalBuf {
     var metadata: InputMetadata
     var pathOnDisk: String
+    var elemCount: Int
     var byteCount: Int
 }
 
 public struct LoadedBuf {
     public var data: MTLBuffer
+    public var argu: MTLArgumentDescriptor
     public var meta: InputMetadata
 }
 
-public struct MamBufLoSoldier {
+public struct MamBufLoSoldier<T> {
     public var heartOf: MTLHeap
-    public var hParams: MambaHParams
+    public var hParams: T
     public var base: [String:LoadedBuf]
     public var layers: [[String:LoadedBuf]]
 }
 
-public class MamBufLoBuilder {
-    let buildingSpec: any ModelStateSpec
-    var hyperparams: MambaHParams
+public class MamBufLoBuilder<T> {
+    let buildingSpec: any ModelStateSpec<T>
+    var nLayers: UInt32
+    var hyperparams: T
     var baseStates = [String:HypotheticalBuf?]()
-    var layerStates = [Int: [String:HypotheticalBuf?]]()
+    var layerStates = [UInt32: [String:HypotheticalBuf?]]()
     
-    public init(_ modelSpec: any ModelStateSpec) throws {
+    public init(_ modelSpec: any ModelStateSpec<T>, nLayers: UInt32) throws {
+        self.nLayers = nLayers
         self.buildingSpec = modelSpec
         self.hyperparams = modelSpec.hp
         self.baseStates = .init(uniqueKeysWithValues: buildingSpec.stateShapes.map { k, v in (k, nil)} )
         self.layerStates = .init(
-            uniqueKeysWithValues: Array(0..<buildingSpec.nLayers).map { n in
+            uniqueKeysWithValues: Array(0..<nLayers).map { n in
                 (n, Dictionary<String, HypotheticalBuf?>.init(
                     uniqueKeysWithValues: buildingSpec.perLayerStateShapes.map { k, v in (k, nil) }
                 ))
@@ -66,10 +70,10 @@ public class MamBufLoBuilder {
     ///     Performs:
     ///         – Load of each state path on disk into a temporary MTLBuffer
     ///         – Blit pass copying temporary MTLBuffer contents into heap
-    public func complete(device: MTLDevice, cmdQ: MTLCommandQueue) throws -> MamBufLoSoldier
+    public func complete(device: MTLDevice, cmdQ: MTLCommandQueue) throws -> MamBufLoSoldier<T>
     {
         let ascendingLayerStates = layerStates.sorted(by: { $0.0 < $1.0 })
-        var expectedLayerNumbers: [Int] = Array(0..<buildingSpec.nLayers)
+        var expectedLayerNumbers: [UInt32] = Array(0..<nLayers)
         var sizeAndAlignmentsByKey: [String:MTLSizeAndAlign] = [:]
         let descriptor = MTLHeapDescriptor()
         descriptor.storageMode = .private
@@ -140,15 +144,23 @@ public class MamBufLoBuilder {
             heapBuf.label = "\(k)_heapBuffer"
             blitEncoder.copy(from: tempBuf, sourceOffset: 0, to: heapBuf, destinationOffset: 0, size: heapBuf.length)
             tempBuf = heapBuf
-            soldier.base[k] = LoadedBuf(data: heapBuf, meta: v.metadata)
+            let argu = MTLArgumentDescriptor()
+            
+            argu.access = .readOnly
+            argu.dataType = .half
+            argu.arrayLength = v.elemCount
+            
+            soldier.base[k] = LoadedBuf(data: heapBuf, argu: argu, meta: v.metadata)
         }
         
         
         for (i, kv) in ascendingLayerStates {
             soldier.layers.append([:])
             for (k, v) in kv {
+                guard let v = v else { throw MamBufLoError.incompleteLayer(k) }
+                
                 print("Loading: \(k)", terminator: "...")
-                var tempBuf = try loadBinaryAsMetalBuffer(binDataPath: v!.pathOnDisk, device: device, metadata: v!.metadata)
+                var tempBuf = try loadBinaryAsMetalBuffer(binDataPath: v.pathOnDisk, device: device, metadata: v.metadata)
                 print("OK\t|\tWill allocate", terminator: "...")
                 
                 guard let heapBuf = heap.makeBuffer(length: tempBuf.length, options: .storageModePrivate, offset: currentOffset)
@@ -159,7 +171,13 @@ public class MamBufLoBuilder {
                 heapBuf.label = "layer_\(i)_\(k)_heapBuffer"
                 blitEncoder.copy(from: tempBuf, sourceOffset: 0, to: heapBuf, destinationOffset: 0, size: heapBuf.length)
                 tempBuf = heapBuf
-                soldier.layers[i][k] = LoadedBuf(data: heapBuf, meta: v!.metadata)
+                
+                let argu = MTLArgumentDescriptor()
+                argu.access = .readOnly
+                argu.dataType = .half
+                argu.arrayLength = v.elemCount
+                
+                soldier.layers[Int(i)][k] = LoadedBuf(data: heapBuf, argu: argu, meta: v.metadata)
                 print("\(heapBuf.length.formatted(.byteCount(style: .file))) ending at \(currentOffset)")
             }
         }
@@ -175,12 +193,12 @@ public class MamBufLoBuilder {
         case .none:
             try includeOuterState(metadata, pathOnDisk: pathOnDisk)
         case .some(let match):
-            guard let layerNumber = Int(match.output.1) else { throw MamBufLoError.unknownLayer(String(match.output.1)) }
+            guard let layerNumber = UInt32(match.output.1) else { throw MamBufLoError.unknownLayer(String(match.output.1)) }
             try includeLayerState(layerNumber, metadata, pathOnDisk: pathOnDisk)
         }
     }
     
-    func matchToPlanElement(_ plan: Dictionary<String, [Int]>, _ metadata: InputMetadata) throws -> Dictionary<String, [Int]>.Element {
+    func matchToPlanElement(_ plan: Dictionary<String, [UInt32]>, _ metadata: InputMetadata) throws -> Dictionary<String, [UInt32]>.Element {
         guard let planElement = plan.first(where: {k, v in metadata.key.contains(k)}) else {
             throw MamBufLoError.invalidParameter("\(metadata.key) has no parts matching: \(plan.keys.debugDescription)")
         }
@@ -192,16 +210,22 @@ public class MamBufLoBuilder {
     
     func includeOuterState(_ metadata: InputMetadata, pathOnDisk: String) throws {
         let planElement = try matchToPlanElement(buildingSpec.stateShapes, metadata)
-        baseStates[planElement.key] = HypotheticalBuf(metadata:metadata,
-                                                      pathOnDisk: pathOnDisk,
-                                                      byteCount: metadata.shape.reduce(1, *) * MemoryLayout<Float16>.stride)
+        let elemCount   = Int(metadata.shape.reduce(1, *))
+        let byteCount   = elemCount * MemoryLayout<Float16>.stride
+        baseStates[planElement.key] = HypotheticalBuf(metadata:     metadata,
+                                                      pathOnDisk:   pathOnDisk,
+                                                      elemCount:    elemCount,
+                                                      byteCount:    byteCount)
     }
     
-    func includeLayerState(_ layerNumber: Int, _ metadata: InputMetadata, pathOnDisk: String) throws {
+    func includeLayerState(_ layerNumber: UInt32, _ metadata: InputMetadata, pathOnDisk: String) throws {
         guard layerStates[layerNumber] != nil else { throw MamBufLoError.unknownLayer(String(layerNumber)) }
+        let elemCount   = Int(metadata.shape.reduce(1, *))
+        let byteCount   = elemCount * MemoryLayout<Float16>.stride
         let planElement = try matchToPlanElement(buildingSpec.perLayerStateShapes, metadata)
-        layerStates[layerNumber]![planElement.key] = HypotheticalBuf(metadata: metadata,
+        layerStates[layerNumber]![planElement.key] = HypotheticalBuf(metadata:   metadata,
                                                                      pathOnDisk: pathOnDisk,
-                                                                     byteCount: metadata.shape.reduce(1, *) * MemoryLayout<Float16>.stride)
+                                                                     elemCount:  elemCount,
+                                                                     byteCount:  byteCount)
     }
 }
