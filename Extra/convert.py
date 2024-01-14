@@ -57,7 +57,7 @@ def main():
             metadata = {
                 'key': key,
                 'shape': data.shape,
-                'stride': data.stride()
+                'is16bit': true
             }
 
             bytes = np_data.tobytes()

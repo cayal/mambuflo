@@ -1,7 +1,7 @@
 import Foundation
 import Metal
 
-public func loadBinaryAsMetalBuffer(binDataPath: String, device: MTLDevice, metadata: InputMetadata) throws -> MTLBuffer {
+public func loadBinaryAsMetalBuffer(binDataPath: String, device: MTLDevice, metadata: MBLStateDictMetadata) throws -> MTLBuffer {
     let url = URL(fileURLWithPath: binDataPath)
     let fileHandle = try FileHandle(forReadingFrom: url)
     guard (try? FileManager.default.attributesOfItem(atPath: url.path())) != nil else {
@@ -15,7 +15,7 @@ public func loadBinaryAsMetalBuffer(binDataPath: String, device: MTLDevice, meta
     
     guard let dataSize = data?.count,
           dataSize == metadata.shape.reduce(MemoryLayout<Float16>.size, {$0 * Int($1)}) else {
-        throw MamBufLoError.incompleteLayer(metadata.key)
+        throw MamBufLoError.incompleteLayer(metadata.stateDictKey)
     }
     var buf: MTLBuffer? = nil
     data!.withUnsafeMutableBytes({ (ptr: UnsafeMutableRawBufferPointer) -> Void in
