@@ -26,65 +26,69 @@ public struct MBLStateDictMetadata: Decodable
     }
 }
 
-public class MBLStateDictKeyMap<ModelSpec, TKey, HParams>
-where ModelSpec: MBLModelSpec<HParams>, TKey: Sequence<KeyPath<HParams, UInt32>> {
-    public var name: String
-    public var kp: KeyPath<ModelSpec, TKey>
-    public init(name: String, kp: KeyPath<ModelSpec, TKey>) {
-        self.name = name
-        self.kp = kp
+
+public struct MBLEntrySpec<ModelSpec: MBLModelSpec, KeyProvider> {
+    public var swiftKey: PartialKeyPath<KeyProvider>
+    public var pythonKey: String
+    public var shape: [KeyPath<ModelSpec.HParams, UInt32>]
+    public init(key: PartialKeyPath<KeyProvider>, pythonKey: String, shape: [KeyPath<ModelSpec.HParams, UInt32>]) {
+        self.swiftKey = key
+        self.pythonKey = pythonKey
+        self.shape = shape
     }
 }
 
-public protocol MBLBaseStateKeys: RawRepresentable {
-    var rawValue: String { get }
-}
 
 public protocol MBLModelSpec<HParams> {
     /// A type describing hyperparameters, which define some properties of the model parameters
     associatedtype HParams
-    associatedtype BaseStateShapeSpec:  Sequence<KeyPath<HParams, UInt32>>
-    associatedtype LayerStateShapeSpec: Sequence<KeyPath<HParams, UInt32>>
-    associatedtype BaseStateDictKeyMap:  MBLStateDictKeyMap<Self, BaseStateShapeSpec, HParams>
-    associatedtype LayerStateDictKeyMap: MBLStateDictKeyMap<Self, LayerStateShapeSpec, HParams>
+    associatedtype BaseKeys
+    associatedtype LayerKeys
+    associatedtype BaseSpecs:  Sequence<MBLEntrySpec<Self, BaseKeys>>
+    associatedtype LayerSpecs: Sequence<MBLEntrySpec<Self, LayerKeys>>
     
     /// The name of a model folder on disk
     var name: String { get }
     var hp: HParams { get }
     
-    /// A dictionary mapping:
-    /// Strings, which may match as a substring of a state-dict key, to:
-    /// Keypaths within this model, which define the shape we expect that state-dict entry to conform to, expressed as the hyperparameter members.
-    var baseStateShapes:     [BaseStateDictKeyMap ]  { get }
-    var perLayerStateShapes: [LayerStateDictKeyMap] { get }
+    var baseSpecs:  BaseSpecs  { get }
+    var layerSpecs: LayerSpecs { get }
 }
 
 extension MBLModelSpec
 {
-    public func findStateDictKeyMap(for sdName: String) throws
-    -> BaseStateDictKeyMap {
-        guard let match = baseStateShapes.first(where: { sdName.contains($0.name) }) else {
+    public func findStateDictSpec(for sdName: String) throws -> MBLEntrySpec<Self, BaseKeys> {
+        guard let match = baseSpecs.first(where: { sdName.contains($0.pythonKey) }) else {
             throw MamBufLoError.unknownLayer("MBLModelSpec.findStateShapeEntry: Nothing in spec matches within \(sdName)")
         }
         return match
     }
     
-    public func findStateDictKeyMap(for sdName: String, layerNumber: UInt32) throws
-    -> LayerStateDictKeyMap {
-        guard let match = perLayerStateShapes.first(where: { sdName.contains($0.name) }) else {
+    public func findStateDictSpec(for sdName: String, layerNumber: UInt32) throws -> MBLEntrySpec<Self, LayerKeys> {
+        guard let match = layerSpecs.first(where: { sdName.contains($0.pythonKey) }) else {
             throw MamBufLoError.unknownLayer("MBLModelSpec.findStateShapeEntry: Nothing in spec matches within \(sdName)")
         }
         return match
     }
     
-    public func validateShapeToPlan(for metadata: MBLStateDictMetadata, layerNumber: UInt32?) throws -> [UInt32] {
-        let match = layerNumber != nil
-                    ? try findStateDictKeyMap(for: metadata.stateDictKey, layerNumber: layerNumber!) as! MBLStateDictKeyMap
-                    : try findStateDictKeyMap(for: metadata.stateDictKey)
-        let plannedShape = self[keyPath: match.kp].map({ hp[keyPath: $0] })
+    public func validateShapeToPlan(for metadata: MBLStateDictMetadata) throws -> [UInt32] {
+        let match = try findStateDictSpec(for: metadata.stateDictKey)
+        let plannedShape = match.shape.map { hp[keyPath: $0] }
         guard metadata.shape == plannedShape else {
             let actual   = "\(metadata.stateDictKey): \(metadata.shape.debugDescription)"
-            let expected = "\(match.kp): \(plannedShape)"
+            let expected = "\(match.shape): \(plannedShape)"
+            throw MamBufLoError.invalidParameterShape("\(actual) is not according to plan \(expected)")
+        }
+
+        return plannedShape
+    }
+    
+    public func validateShapeToPlan(for metadata: MBLStateDictMetadata, layerNumber: UInt32) throws -> [UInt32] {
+        let match = try findStateDictSpec(for: metadata.stateDictKey, layerNumber: layerNumber)
+        let plannedShape = match.shape.map { hp[keyPath: $0] }
+        guard metadata.shape == plannedShape else {
+            let actual   = "\(metadata.stateDictKey): \(metadata.shape.debugDescription)"
+            let expected = "\(match.shape): \(plannedShape)"
             throw MamBufLoError.invalidParameterShape("\(actual) is not according to plan \(expected)")
         }
 
@@ -171,13 +175,13 @@ public struct MBLHeapedParameter {
     
     
     public func getKeyPath<ModelSpec: MBLModelSpec>(within modelSpec: ModelSpec) throws
-    -> KeyPath<ModelSpec, ModelSpec.BaseStateShapeSpec> {
-        return try modelSpec.findStateDictKeyMap(for: desc.metadata.stateDictKey).kp
+    -> PartialKeyPath<ModelSpec.BaseKeys> {
+        return try modelSpec.findStateDictSpec(for: desc.metadata.stateDictKey).swiftKey
     }
     
     public func getKeyPath<ModelSpec: MBLModelSpec>(within modelSpec: ModelSpec) throws
-    -> KeyPath<ModelSpec, ModelSpec.LayerStateShapeSpec> {
-        return try modelSpec.findStateDictKeyMap(for: desc.metadata.stateDictKey, layerNumber: desc.layerNumber!).kp 
+    -> PartialKeyPath<ModelSpec.LayerKeys> {
+        return try modelSpec.findStateDictSpec(for: desc.metadata.stateDictKey, layerNumber: desc.layerNumber!).swiftKey
     }
 }
 
@@ -185,13 +189,13 @@ public struct MBLHeapedParameter {
 @dynamicMemberLookup
 public struct MBLSpecificHeapedBaseParams<ModelSpec: MBLModelSpec>
 {
-    private var params: [KeyPath<ModelSpec, ModelSpec.BaseStateShapeSpec>:MBLHeapedParameter] = [:]
+    private var params: [PartialKeyPath<ModelSpec.BaseKeys>:MBLHeapedParameter] = [:]
     
     public init(_ spec: ModelSpec, loads: [MBLHeapedParameter]) throws {
         self.params = .init( uniqueKeysWithValues: try loads.map { (try $0.getKeyPath(within: spec), $0) } )
     }
     
-    public subscript(dynamicMember keyPath: KeyPath<ModelSpec, ModelSpec.BaseStateShapeSpec>) -> MBLHeapedParameter? {
+    public subscript(dynamicMember keyPath: KeyPath<ModelSpec.BaseKeys, Any>) -> MBLHeapedParameter? {
         return params[keyPath]
     }
 }
@@ -199,13 +203,13 @@ public struct MBLSpecificHeapedBaseParams<ModelSpec: MBLModelSpec>
 @dynamicMemberLookup
 public struct MBLSpecificHeapedLayerParams<ModelSpec: MBLModelSpec>
 {
-    private var params: [KeyPath<ModelSpec, ModelSpec.LayerStateShapeSpec>:MBLHeapedParameter] = [:]
+    private var params: [PartialKeyPath<ModelSpec.LayerKeys>:MBLHeapedParameter] = [:]
     
     public init(_ spec: ModelSpec, loads: [MBLHeapedParameter]) throws {
         self.params = .init( uniqueKeysWithValues: try loads.map { (try $0.getKeyPath(within: spec), $0) } )
     }
     
-    public subscript(dynamicMember keyPath: KeyPath<ModelSpec, ModelSpec.LayerStateShapeSpec>) -> MBLHeapedParameter? {
+    public subscript(dynamicMember keyPath: KeyPath<ModelSpec.LayerKeys, Any>) -> MBLHeapedParameter? {
         return params[keyPath]
     }
 }
@@ -242,50 +246,44 @@ public struct MBLState<ModelSpec: MBLModelSpec> {
 
 public class MBLParameterStateCollection<THParams, ModelSpec: MBLModelSpec<THParams>> {
     private var modelSpec: ModelSpec
-    private var forLayers: Bool
-    
-    /// The description from the modelSpec, with the shape expectations filled in
-    private var stateShapeExpectations: [String: [UInt32]] = [:]
     
     /// Descriptors for the stateDict preparing to be loaded, whose values are gradually filled
-    private var stateDictDescriptors:   [String: MBLStateDictEntryDescriptor?] = [:]
+    private var stateDictDescriptors:   [(String, MBLStateDictEntryDescriptor?)] = []
     
-    public init(_ modelSpec: ModelSpec, forLayers: Bool) {
+    public init<TKeys>(_ modelSpec: ModelSpec, specs: [MBLEntrySpec<ModelSpec, TKeys>]) {
+        
         self.modelSpec = modelSpec
-        self.forLayers = forLayers
-        let shapeSpecs = self.forLayers 
-        ? modelSpec.perLayerStateShapes as! any Sequence<MBLStateDictKeyMap<ModelSpec, [KeyPath<THParams, UInt32>], THParams>>
-        : modelSpec.baseStateShapes as! any Sequence<MBLStateDictKeyMap>
         
-        self.stateShapeExpectations = .init(uniqueKeysWithValues: shapeSpecs.map({ entry in
-            (key: entry.name, value: modelSpec[keyPath: entry.kp].map { modelSpec.hp[keyPath: $0]})
-        }))
-        
-        let planKeys = self.stateShapeExpectations.keys
-        planKeys.forEach({ k in self.stateDictDescriptors[k] = nil })
+        // Initialize StateDictDescriptors in the same order as the state specs
+        specs.forEach { plan in
+            self.stateDictDescriptors.append((plan.pythonKey, nil))
+        }
     }
     
-    public func include(_ desc: MBLStateDictEntryDescriptor) throws {
-        guard let key = self.stateShapeExpectations.keys.first(where: {desc.metadata.stateDictKey.contains($0)}) else {
-            throw MamBufLoError.unknownLayer("Did not match \(desc.metadata.stateDictKey)" +
-                                             "to any of \(stateShapeExpectations.keys)")
+    public func include<TKeys>(_ desc: MBLStateDictEntryDescriptor, spec: MBLEntrySpec<ModelSpec, TKeys>) throws {
+        self.stateDictDescriptors = try self.stateDictDescriptors.map { sd in
+            if sd.0 == spec.pythonKey {
+                switch desc.layerNumber {
+                case .none:
+                    _ = try modelSpec.validateShapeToPlan(for: desc.metadata)
+                    return (sd.0, desc)
+                case .some(let ln):
+                    _ = try modelSpec.validateShapeToPlan(for: desc.metadata, layerNumber: ln)
+                    return (sd.0, desc)
+                }
+            } else {
+                return sd
+            }
         }
-        
-        guard self.stateDictDescriptors[key] == nil else {
-            throw MamBufLoError.extraneousStateEntry(desc.metadata.stateDictKey)
-        }
-        
-        let shape = try modelSpec.validateShapeToPlan(for: desc.metadata, layerNumber: desc.layerNumber)
-        self.stateDictDescriptors[key] = desc
     }
     
     public func complete() throws -> [MBLStateDictEntryDescriptor] {
-        guard stateDictDescriptors.allSatisfy({$0.value != nil}) else {
-            let missing = stateDictDescriptors.filter({$0.value == nil }).keys
-            throw MamBufLoError.incompleteState("MBLParameterStateCollection.next: missing states: \(missing)" )
+        guard stateDictDescriptors.allSatisfy({$0.1 != nil}) else {
+            let missing = stateDictDescriptors.filter({$0.1 == nil }).first
+            throw MamBufLoError.incompleteState("MBLParameterStateCollection.next: missing states: \(missing!.0)" )
         }
         
-        return stateDictDescriptors.compactMap({$0.value})
+        return stateDictDescriptors.compactMap({$0.1})
     }
     
 }
@@ -400,11 +398,11 @@ public class MamBufLoBuilder<THParams, ModelSpec: MBLModelSpec<THParams>> {
         self.buildingSpec = modelSpec
         self.hyperparams = modelSpec.hp
         
-        self.baseStatesUnderway = MBLParameterStateCollection(modelSpec, forLayers: false)
+        self.baseStatesUnderway = MBLParameterStateCollection(modelSpec, specs: modelSpec.baseSpecs as! [MBLEntrySpec<ModelSpec, ModelSpec.BaseKeys>])
         
-        let perLayerKeys = self.buildingSpec.perLayerStateShapes.map({ $0.name })
+        let perLayerKeys = self.buildingSpec.layerSpecs.map({ $0.pythonKey })
         Array<UInt32>(0..<nLayers).forEach({ n in
-            layerStatesUnderway[n] = MBLParameterStateCollection(modelSpec, forLayers: true)
+            layerStatesUnderway[n] = MBLParameterStateCollection(modelSpec, specs: modelSpec.layerSpecs as! [MBLEntrySpec<ModelSpec, ModelSpec.LayerKeys>])
         })
     }
     
@@ -434,15 +432,14 @@ public class MamBufLoBuilder<THParams, ModelSpec: MBLModelSpec<THParams>> {
     }
     
     public func include(_ stateEntryPath: String) throws {
-        let exp = try MBLStateDictEntryDescriptor(stateEntryPath)
-        let forLayers = exp.layerNumber != nil
-        switch(exp.layerNumber) {
+        let desc = try MBLStateDictEntryDescriptor(stateEntryPath)
+        switch(desc.layerNumber) {
         case .none:
-            let kp = try buildingSpec.findStateDictKeyMap(for: exp.metadata.stateDictKey)
-            try baseStatesUnderway.include(exp)
+            let spec = try buildingSpec.findStateDictSpec(for: desc.metadata.stateDictKey)
+            try baseStatesUnderway.include(desc, spec: spec)
         case .some(let ln):
-            let kp = try buildingSpec.findStateDictKeyMap(for: exp.metadata.stateDictKey, layerNumber: ln)
-            try layerStatesUnderway[ln]!.include(exp)
+            let spec = try buildingSpec.findStateDictSpec(for: desc.metadata.stateDictKey, layerNumber: ln)
+            try layerStatesUnderway[ln]!.include(desc, spec: spec)
         }
     }
 }
