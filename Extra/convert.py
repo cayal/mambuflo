@@ -53,11 +53,12 @@ def main():
             foldername = Path(os.path.dirname(__file__)) / "converted" / model_name / key
             os.makedirs(foldername, exist_ok=True)
             data  = state_dict[key]
-            np_data = data.numpy().astype('f2', order='C')
+            dtype = 'f2' if any([x in key for x in ["embedding", "lm_head", "in_proj", "out_proj", "x_proj"]]) else 'f4'
+            np_data = data.numpy().astype(dtype, order='C')
             metadata = {
                 'key': key,
                 'shape': data.shape,
-                'is16bit': true
+                'is16bit': dtype == 'f2'
             }
 
             bytes = np_data.tobytes()

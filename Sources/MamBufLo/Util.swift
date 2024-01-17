@@ -1,5 +1,9 @@
 import Foundation
 import Metal
+#if arch(i386) || arch(x86_64)
+   @available(macOS 14.0, iOS 17.0, *)
+   typealias Float16 = Float32
+#endif
 
 public func loadBinaryAsMetalBuffer(binDataPath: String, device: MTLDevice, metadata: MBLStateDictMetadata) throws -> MTLBuffer {
     let url = URL(fileURLWithPath: binDataPath)
@@ -14,7 +18,7 @@ public func loadBinaryAsMetalBuffer(binDataPath: String, device: MTLDevice, meta
     }
     
     guard let dataSize = data?.count,
-          dataSize == metadata.shape.reduce(MemoryLayout<Float16>.size, {$0 * Int($1)}) else {
+          dataSize == metadata.shape.reduce(metadata.baseStride, {$0 * Int($1)}) else {
         throw MamBufLoError.incompleteLayer(metadata.stateDictKey)
     }
     var buf: MTLBuffer? = nil

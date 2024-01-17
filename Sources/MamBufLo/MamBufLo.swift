@@ -26,121 +26,6 @@ public struct MBLStateDictMetadata: Decodable
     }
 }
 
-
-public struct MBLEntrySpec<ModelSpec: MBLModelSpec, KeyProvider> {
-    public var swiftKey: PartialKeyPath<KeyProvider>
-    public var pythonKey: String
-    public var shape: [KeyPath<ModelSpec.HParams, UInt32>]
-    public init(key: PartialKeyPath<KeyProvider>, pythonKey: String, shape: [KeyPath<ModelSpec.HParams, UInt32>]) {
-        self.swiftKey = key
-        self.pythonKey = pythonKey
-        self.shape = shape
-    }
-}
-
-
-public protocol MBLModelSpec<HParams> {
-    /// A type describing hyperparameters, which define some properties of the model parameters
-    associatedtype HParams
-    associatedtype BaseKeys
-    associatedtype LayerKeys
-    associatedtype BaseSpecs:  Sequence<MBLEntrySpec<Self, BaseKeys>>
-    associatedtype LayerSpecs: Sequence<MBLEntrySpec<Self, LayerKeys>>
-    
-    /// The name of a model folder on disk
-    var name: String { get }
-    var hp: HParams { get }
-    
-    var baseSpecs:  BaseSpecs  { get }
-    var layerSpecs: LayerSpecs { get }
-}
-
-extension MBLModelSpec
-{
-    public func findStateDictSpec(for sdName: String) throws -> MBLEntrySpec<Self, BaseKeys> {
-        guard let match = baseSpecs.first(where: { sdName.contains($0.pythonKey) }) else {
-            throw MamBufLoError.unknownLayer("MBLModelSpec.findStateShapeEntry: Nothing in spec matches within \(sdName)")
-        }
-        return match
-    }
-    
-    public func findStateDictSpec(for sdName: String, layerNumber: UInt32) throws -> MBLEntrySpec<Self, LayerKeys> {
-        guard let match = layerSpecs.first(where: { sdName.contains($0.pythonKey) }) else {
-            throw MamBufLoError.unknownLayer("MBLModelSpec.findStateShapeEntry: Nothing in spec matches within \(sdName)")
-        }
-        return match
-    }
-    
-    public func validateShapeToPlan(for metadata: MBLStateDictMetadata) throws -> [UInt32] {
-        let match = try findStateDictSpec(for: metadata.stateDictKey)
-        let plannedShape = match.shape.map { hp[keyPath: $0] }
-        guard metadata.shape == plannedShape else {
-            let actual   = "\(metadata.stateDictKey): \(metadata.shape.debugDescription)"
-            let expected = "\(match.shape): \(plannedShape)"
-            throw MamBufLoError.invalidParameterShape("\(actual) is not according to plan \(expected)")
-        }
-
-        return plannedShape
-    }
-    
-    public func validateShapeToPlan(for metadata: MBLStateDictMetadata, layerNumber: UInt32) throws -> [UInt32] {
-        let match = try findStateDictSpec(for: metadata.stateDictKey, layerNumber: layerNumber)
-        let plannedShape = match.shape.map { hp[keyPath: $0] }
-        guard metadata.shape == plannedShape else {
-            let actual   = "\(metadata.stateDictKey): \(metadata.shape.debugDescription)"
-            let expected = "\(match.shape): \(plannedShape)"
-            throw MamBufLoError.invalidParameterShape("\(actual) is not according to plan \(expected)")
-        }
-
-        return plannedShape
-    }
-}
-
-public struct MBLStateDictEntryDescriptor: Hashable, Equatable
-{
-    public let metadata: MBLStateDictMetadata
-    public let dataPath: String
-    public var layerNumber: UInt32?
-    
-    public var elemCount: Int { Int(metadata.shape.reduce(1, *)) }
-    public var bytesExpected: Int { elemCount * metadata.baseStride  }
-    public var prettyName: String {
-        metadata.stateDictKey
-        + "/"
-        + (layerNumber?.formatted() ?? "base")
-    }
-    
-    public init(_ stateEntryPath: String) throws {
-        let metadataPath = stateEntryPath + "/metadata.json"
-        let metadataJson = try String(contentsOfFile: metadataPath)
-        let metadata = try JSONDecoder().decode(MBLStateDictMetadata.self, from: metadataJson.data(using: .utf8)!)
-        self.metadata = metadata
-        self.dataPath = stateEntryPath + "/weights.bin"
-        self.layerNumber = try? UInt32(String(/layers\.([0-9]+)/.firstMatch(in: metadata.stateDictKey)?.output.1 ?? ""))
-        try validateBytesExpected()
-    }
-    
-    public func validateBytesExpected() throws {
-        let atts = try FileManager.default.attributesOfItem(atPath: dataPath)
-        let fileSize = atts[.size] as? Int
-        guard fileSize == bytesExpected else {
-            let desc = "\(metadata.stateDictKey): shape \(metadata.shape)"
-            let sizeEx = bytesExpected.formatted(.byteCount(style: .file))
-            let sizeAc = fileSize?.formatted(.byteCount(style: .file)) ?? "unknown"
-            throw MamBufLoError.filesizeMismatch("\(desc) implies a filesize of \(sizeEx), but actual filesize is \(sizeAc)")
-        }
-    }
-    
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(metadata.stateDictKey)
-    }
-    
-    public static func == (lhs: MBLStateDictEntryDescriptor, rhs: MBLStateDictEntryDescriptor) -> Bool {
-        lhs.hashValue == rhs.hashValue
-    }
-}
-
-
 enum MamBufLoError: Error {
     case invalidFile(String),
          incompleteState(String),
@@ -152,11 +37,27 @@ enum MamBufLoError: Error {
          missingLayer(UInt32),
          incompleteLayer(String),
          unknownLayer(String),
+         unknownPreprocessor(String),
          failedToMakeCommandBuffer,
          failedToMakeCommandEncoder,
          failedToMakeMetalBuffer,
          failedToMakeMetalHeap,
          internalError
+}
+
+public struct MBLHeapedScratchBuffer {
+    public var data: MTLBuffer
+    public var shape: [UInt32]
+    public var name: String
+    
+    public lazy var argu: MTLArgumentDescriptor = {
+        let argu = MTLArgumentDescriptor()
+        
+        argu.access = .readWrite
+        argu.dataType = .half
+        argu.arrayLength = data.length / MemoryLayout<Float16>.stride
+        return argu
+    }()
 }
 
 public struct MBLHeapedParameter {
@@ -168,7 +69,7 @@ public struct MBLHeapedParameter {
         let argu = MTLArgumentDescriptor()
         
         argu.access = .readOnly
-        argu.dataType = .half
+        argu.dataType = desc.metadata.baseStride == 2 ? .half : .float
         argu.arrayLength = desc.elemCount
         return argu
     }()
@@ -185,138 +86,32 @@ public struct MBLHeapedParameter {
     }
 }
 
-
-@dynamicMemberLookup
-public struct MBLSpecificHeapedBaseParams<ModelSpec: MBLModelSpec>
-{
-    private var params: [PartialKeyPath<ModelSpec.BaseKeys>:MBLHeapedParameter] = [:]
-    
-    public init(_ spec: ModelSpec, loads: [MBLHeapedParameter]) throws {
-        self.params = .init( uniqueKeysWithValues: try loads.map { (try $0.getKeyPath(within: spec), $0) } )
-    }
-    
-    public subscript(dynamicMember keyPath: KeyPath<ModelSpec.BaseKeys, Any>) -> MBLHeapedParameter? {
-        return params[keyPath]
-    }
-}
-
-@dynamicMemberLookup
-public struct MBLSpecificHeapedLayerParams<ModelSpec: MBLModelSpec>
-{
-    private var params: [PartialKeyPath<ModelSpec.LayerKeys>:MBLHeapedParameter] = [:]
-    
-    public init(_ spec: ModelSpec, loads: [MBLHeapedParameter]) throws {
-        self.params = .init( uniqueKeysWithValues: try loads.map { (try $0.getKeyPath(within: spec), $0) } )
-    }
-    
-    public subscript(dynamicMember keyPath: KeyPath<ModelSpec.LayerKeys, Any>) -> MBLHeapedParameter? {
-        return params[keyPath]
-    }
-}
-
-public struct MBLState<ModelSpec: MBLModelSpec> {
-    public var spec: ModelSpec
-    public var base:            MBLSpecificHeapedBaseParams<ModelSpec>
-    public var layers: [UInt32: MBLSpecificHeapedLayerParams<ModelSpec>] = [:]
-    
-    init(_ spec: ModelSpec,
-         heap: MTLHeap,
-         loads: [MBLHeapedParameter]) throws {
-        self.spec = spec
-        
-        let baseLoads  = loads.filter { $0.desc.layerNumber == nil }
-        let layerLoads = loads.filter { $0.desc.layerNumber != nil }
-        
-        self.base = try MBLSpecificHeapedBaseParams(spec, loads: baseLoads)
-        
-        // Layer loads by layer number
-        var llbln: [UInt32: [MBLHeapedParameter]] = [:]
-        for ll in layerLoads {
-            if (llbln[ll.desc.layerNumber!] == nil) {
-                llbln[ll.desc.layerNumber!] = []
-            }
-            llbln[ll.desc.layerNumber!]!.append(ll)
-        }
-        
-        for (ln, ll) in llbln {
-            self.layers[ln] = try MBLSpecificHeapedLayerParams(spec, loads: ll)
-        }
-    }
-}
-
-public class MBLParameterStateCollection<THParams, ModelSpec: MBLModelSpec<THParams>> {
-    private var modelSpec: ModelSpec
-    
-    /// Descriptors for the stateDict preparing to be loaded, whose values are gradually filled
-    private var stateDictDescriptors:   [(String, MBLStateDictEntryDescriptor?)] = []
-    
-    public init<TKeys>(_ modelSpec: ModelSpec, specs: [MBLEntrySpec<ModelSpec, TKeys>]) {
-        
-        self.modelSpec = modelSpec
-        
-        // Initialize StateDictDescriptors in the same order as the state specs
-        specs.forEach { plan in
-            self.stateDictDescriptors.append((plan.pythonKey, nil))
-        }
-    }
-    
-    public func include<TKeys>(_ desc: MBLStateDictEntryDescriptor, spec: MBLEntrySpec<ModelSpec, TKeys>) throws {
-        self.stateDictDescriptors = try self.stateDictDescriptors.map { sd in
-            if sd.0 == spec.pythonKey {
-                switch desc.layerNumber {
-                case .none:
-                    _ = try modelSpec.validateShapeToPlan(for: desc.metadata)
-                    return (sd.0, desc)
-                case .some(let ln):
-                    _ = try modelSpec.validateShapeToPlan(for: desc.metadata, layerNumber: ln)
-                    return (sd.0, desc)
-                }
-            } else {
-                return sd
-            }
-        }
-    }
-    
-    public func complete() throws -> [MBLStateDictEntryDescriptor] {
-        guard stateDictDescriptors.allSatisfy({$0.1 != nil}) else {
-            let missing = stateDictDescriptors.filter({$0.1 == nil }).first
-            throw MamBufLoError.incompleteState("MBLParameterStateCollection.next: missing states: \(missing!.0)" )
-        }
-        
-        return stateDictDescriptors.compactMap({$0.1})
-    }
-    
-}
-
 public class MamBufHeapLoader {
     private var device: MTLDevice
     private var heapDescriptor: MTLHeapDescriptor
-    private var cmdBuf: MTLCommandBuffer
-    private var blitEncoder: MTLBlitCommandEncoder
+    private var cmdQ: MTLCommandQueue
+    private var ppLibrary: MTLLibrary
     private var sizeAndAlignments: [MBLStateDictEntryDescriptor:MTLSizeAndAlign] = [:]
     private var currentNewBufferOffsetInHeap: Int = 0
     
     public var heap: MTLHeap? = nil
     
-    public init(device: MTLDevice, cmdQ: MTLCommandQueue) throws {
+    public init(device: MTLDevice, cmdQ: MTLCommandQueue, ppLibrary: MTLLibrary) throws {
         self.device = device
         self.heapDescriptor = MTLHeapDescriptor()
-        self.heapDescriptor.storageMode = .private
+        self.heapDescriptor.storageMode = .shared
+        // TODO undebug
+        //        self.heapDescriptor.storageMode = .private
         self.heapDescriptor.hazardTrackingMode = .untracked
         self.heapDescriptor.type = .placement
         self.heapDescriptor.size = 0
 
-        guard let cmdBuf = cmdQ.makeCommandBuffer() else { throw MamBufLoError.failedToMakeCommandBuffer }
-        self.cmdBuf = cmdBuf
-        self.cmdBuf.label = "StateBuilder_cmdBuf"
-        
-        guard let blitEncoder = cmdBuf.makeBlitCommandEncoder() else { throw MamBufLoError.failedToMakeCommandEncoder }
-        self.blitEncoder = blitEncoder
-        self.blitEncoder.label = "StateBuilder_blitEncoder"
+        self.ppLibrary = ppLibrary
+        self.cmdQ = cmdQ
     }
     
     public func assignPositionForState(positioning desc: MBLStateDictEntryDescriptor) throws {
-        var saa : MTLSizeAndAlign = device.heapBufferSizeAndAlign(length: desc.bytesExpected, options: .storageModePrivate)
+        var saa : MTLSizeAndAlign = device.heapBufferSizeAndAlign(length: desc.bytesExpected, options: .storageModeShared) // TODO undebug
         // Apparently, aligning the size so that more resources fit onto heap after this buffer
         saa.size += (saa.size & (saa.align - 1)) + saa.align;
         self.heapDescriptor.size += saa.size
@@ -353,34 +148,44 @@ public class MamBufHeapLoader {
         var tempBuf = try loadBinaryAsMetalBuffer(binDataPath: desc.dataPath,
                                                   device: device,
                                                   metadata: desc.metadata)
+                
+        tempBuf = try modelSpec.preprocess(&tempBuf,
+                                           desc: desc,
+                                           device: device,
+                                           cmdQ: cmdQ,
+                                           library: ppLibrary)
         
-        print("OK\t|\tWill allocate", terminator: "...")
+        print("OK\n\t|\tWill allocate \(tempBuf.length.formatted(.byteCount(style: .file)))", terminator: "...")
         
         // Allocate a new buffer allocated off the heap
         guard let heapBuf = heap.makeBuffer(length: tempBuf.length,
-                                            options: .storageModePrivate,
+                                            options: .storageModeShared, // TODO undebug
+                                            //                                            options: .storageModePrivate,
                                             offset: self.currentNewBufferOffsetInHeap) else {
             throw MamBufLoError.failedToMakeMetalHeap
         }
         self.currentNewBufferOffsetInHeap += saa.size
         heapBuf.label = "\(desc.prettyName)_heapBuffer"
         
-        self.blitEncoder.copy(from: tempBuf, sourceOffset: 0, to: heapBuf, destinationOffset: 0, size: heapBuf.length)
+        
+        guard let cmdBuf = cmdQ.makeCommandBuffer() else { throw MamBufLoError.failedToMakeCommandBuffer }
+        cmdBuf.label = "\(desc.prettyName)_StateBuilder_cmdBuf"
+        
+        guard let blitEncoder = cmdBuf.makeBlitCommandEncoder() else { throw MamBufLoError.failedToMakeCommandEncoder }
+        blitEncoder.label = "\(desc.prettyName)_StateBuilder_blitEncoder"
+        blitEncoder.copy(from: tempBuf, sourceOffset: 0, to: heapBuf, destinationOffset: 0, size: heapBuf.length)
+        
+        blitEncoder.endEncoding()
+        cmdBuf.commit()
+        cmdBuf.waitUntilCompleted()
         tempBuf.contents().deallocate()
         
-        print("\(heapBuf.length.formatted(.byteCount(style: .file))) ending at \(self.currentNewBufferOffsetInHeap)")
+        print("OK\n\t|\t \(self.currentNewBufferOffsetInHeap): \((Float(currentNewBufferOffsetInHeap) / Float(heap.currentAllocatedSize)).formatted(.percent)) complete")
 
         
         let shapedBuf = MBLHeapedParameter(data: heapBuf,
                                            desc: desc)
         return shapedBuf
-    }
-    
-    public func commit() throws {
-        guard self.heap != nil else { throw MamBufLoError.incompleteState("MamBufHeapLoader.commit: Call makeHeap() and/or loadToHeap() first") }
-        blitEncoder.endEncoding()
-        cmdBuf.commit()
-        print("Loaded model state | Size: \(heap!.currentAllocatedSize.formatted(.byteCount(style: .file)))")
     }
 }
 
@@ -406,7 +211,7 @@ public class MamBufLoBuilder<THParams, ModelSpec: MBLModelSpec<THParams>> {
         })
     }
     
-    public func buildStateHeap(device: MTLDevice, cmdQ: MTLCommandQueue) throws -> MBLState<ModelSpec>
+    public func buildStateHeap(device: MTLDevice, cmdQ: MTLCommandQueue, ppLibrary: MTLLibrary) throws -> MBLState<ModelSpec>
     {
         let ascendingLayerStates = layerStatesUnderway.sorted(by: { $0.0 < $1.0 })
         
@@ -414,7 +219,8 @@ public class MamBufLoBuilder<THParams, ModelSpec: MBLModelSpec<THParams>> {
         let layerStateDescriptors = try ascendingLayerStates.flatMap { try $0.value.complete() }
         
         var heaper = try MamBufHeapLoader(device: device,
-                                          cmdQ: cmdQ)
+                                          cmdQ: cmdQ,
+                                          ppLibrary: ppLibrary)
         
         for desc in (baseStateDescriptors + layerStateDescriptors) {
             try heaper.assignPositionForState(positioning: desc)
@@ -427,7 +233,6 @@ public class MamBufLoBuilder<THParams, ModelSpec: MBLModelSpec<THParams>> {
             loads.append(try heaper.loadToHeap(desc, modelSpec: buildingSpec))
         }
         
-        try heaper.commit()
         return try MBLState(buildingSpec, heap: heap, loads: loads)
     }
     
@@ -442,4 +247,27 @@ public class MamBufLoBuilder<THParams, ModelSpec: MBLModelSpec<THParams>> {
             try layerStatesUnderway[ln]!.include(desc, spec: spec)
         }
     }
+}
+
+func withDebugCapture<T>(on device: MTLDevice, execute closure: () throws -> T) rethrows -> T {
+    let sharedCapturer = MTLCaptureManager.shared()
+    let customScope = sharedCapturer.makeCaptureScope(device: device)
+    customScope.label = "Pls fix it"
+    sharedCapturer.defaultCaptureScope = customScope
+
+    let captureDescriptor = MTLCaptureDescriptor()
+    captureDescriptor.captureObject = device
+    do {
+        try sharedCapturer.startCapture(with: captureDescriptor)
+    } catch {
+        fatalError("Failed to capture: \(error)")
+    }
+    customScope.begin()
+
+    let result = try closure()
+
+    customScope.end()
+    sharedCapturer.stopCapture()
+
+    return result
 }
